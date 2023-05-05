@@ -2,16 +2,20 @@ package main
 
 import (
 	"context"
+	"crypto/ecdsa"
 	"flag"
 	"fmt"
+	"io/ioutil"
 	"log"
+	"net/http"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/machinebox/graphql"
 )
 
-type ChallengeRes struct {
+type Challenge struct {
 	Challenge struct {
 		Text string
 	} `graphql:"challenge(request: $request)"`
@@ -21,44 +25,50 @@ type ChallengeRequest struct {
 	Address string `json:"address"`
 }
 
-type EIP4361Request struct {
-	EIP191Message string `json:"message,omitempty"`
-	Signature     string `json:"signature,omitempty"`
-}
-
 func main() {
-	domain := "memo.io"
-
-	address := flag.String("address", "0x51632235cc673a788E02B30B9F16F7B1D300194C", "the login address")
-	nonce := flag.String("nonce", "b0fb86116a9d914f6ec41c87baf748d64c1f19f7bd3abf1d1cc7fc0e5627c8c1", "the login nonce")
 	secretKey := flag.String("sk", "", "the sk to signature")
 
 	flag.Parse()
 
-	// eth login
-	hash := crypto.Keccak256([]byte(*address), []byte(*nonce), []byte(domain))
-	fmt.Println("sk length:", len(*secretKey), len([]byte(*secretKey)))
-	sk, err := crypto.HexToECDSA(*secretKey)
+	privateKey, err := crypto.HexToECDSA(*secretKey)
+	if err != nil {
+		fmt.Println(err.Error())
+		return
+	}
+
+	publicKey := privateKey.Public()
+	publicKeyECDSA, ok := publicKey.(*ecdsa.PublicKey)
+	if !ok {
+		log.Fatal("cannot assert type: publicKey is not of type *ecdsa.PublicKey")
+	}
+	address := crypto.PubkeyToAddress(*publicKeyECDSA).Hex()
+
+	// get MEMO-Middleware challenge message for eth account
+	text, err := challenge(address)
 	if err != nil {
 		log.Fatal(err)
 	}
-	signature, err := crypto.Sign(hash, sk)
+	fmt.Println("message:\n", text)
+
+	// eip191-signature to sign for eth account
+	hash := crypto.Keccak256([]byte(fmt.Sprintf("\x19Ethereum Signed Message:\n%d%s", len(text), text)))
+	signature, err := crypto.Sign(hash, privateKey)
 	if err != nil {
 		log.Fatal(err)
 	}
 	sig := hexutil.Encode(signature)
-	fmt.Println("eth login sig: ", sig)
-	fmt.Println()
+	fmt.Println("login sig:\n", sig)
 
-	// lens login
-	text, err := Challenge(*address)
+	// get Lens challenge message
+	fmt.Println()
+	text, err = challengeLens(address)
 	if err != nil {
 		log.Fatal(err)
 	}
-	fmt.Println("message:")
-	fmt.Println(text)
+	fmt.Println("Lens message:\n", text)
+
 	hash = crypto.Keccak256([]byte(fmt.Sprintf("\x19Ethereum Signed Message:\n%d%s", len(text), text)))
-	signature, err = crypto.Sign(hash, sk)
+	signature, err = crypto.Sign(hash, privateKey)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -66,7 +76,42 @@ func main() {
 	fmt.Println("lens login sig:\n", sig)
 }
 
-func Challenge(address string) (string, error) {
+// get message to signature for eth account
+func challenge(address string) (string, error) {
+	client := &http.Client{Timeout: time.Minute}
+	// ip:port should be corresponding to that MEMO-Middleware server is listening
+	url := "http://localhost:8081/challenge"
+
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return "", err
+	}
+
+	params := req.URL.Query()
+	params.Add("address", address)
+	req.URL.RawQuery = params.Encode()
+	req.Header.Set("Origin", "https://memo.io")
+
+	res, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer res.Body.Close()
+
+	body, err := ioutil.ReadAll(res.Body)
+	if err != nil {
+		return "", err
+	}
+
+	if res.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("respond code[%d]: %s", res.StatusCode, string(body))
+	}
+
+	return string(body), nil
+}
+
+// get message to signature for lens account
+func challengeLens(address string) (string, error) {
 	client := graphql.NewClient("https://api.lens.dev")
 
 	req := graphql.NewRequest(`
@@ -79,7 +124,7 @@ func Challenge(address string) (string, error) {
 	req.Var("request", ChallengeRequest{Address: address})
 	req.Header.Set("Origin", "memo.io")
 
-	var query ChallengeRes
+	var query Challenge
 	if err := client.Run(context.Background(), req, &query); err != nil {
 		return "", err
 	}
